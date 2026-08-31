@@ -37,7 +37,7 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/azfoundary/moneylover-go/moneylover"
+	"github.com/azfoundary/burnrate-adapter/moneylover"
 )
 
 // adapterVersion is reported on every heartbeat so the server can say when a
@@ -53,6 +53,16 @@ const configName = "burnrate-adapter.json"
 type adapterConfig struct {
 	Server string `json:"server"`
 	Token  string `json:"token"`
+	// Service names which thing this adapter writes to. There is one today,
+	// and the field exists anyway: config files live in people's Downloads
+	// folders, so a version that omits it can never be told apart from a
+	// future one that means something else. Empty is read as "moneylover",
+	// which is what every file issued so far means.
+	//
+	// This is NOT an abstraction. Nothing dispatches on it yet, because a
+	// second service is what would reveal the right shape and guessing at it
+	// from one implementation produces the wrong seam.
+	Service string `json:"service,omitempty"`
 	// Email is remembered after the first run so only the password is asked
 	// for when a MoneyLover session expires. The password is never written
 	// here, or anywhere.
@@ -160,6 +170,13 @@ func loadAdapterConfig() (string, adapterConfig, error) {
 			return p, c, fmt.Errorf("%s has no server address or no token — download it again from Settings, Adapter", p)
 		}
 		c.Server = strings.TrimRight(c.Server, "/")
+		if c.Service == "" {
+			c.Service = "moneylover"
+		}
+		if c.Service != "moneylover" {
+			return p, c, fmt.Errorf(
+				"%s is for %q, and this adapter only knows how to write to MoneyLover — download a newer adapter", p, c.Service)
+		}
 		return p, c, nil
 	}
 	return "", adapterConfig{}, errors.New(

@@ -1,4 +1,4 @@
-module github.com/azfoundary/moneylover-go
+module github.com/azfoundary/burnrate-adapter
 
 go 1.26
 

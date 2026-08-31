@@ -29,7 +29,7 @@ server.
 ## Using it
 
 1. Download the file for your platform from
-   [Releases](https://github.com/azfoundary/moneylover-go/releases/latest).
+   [Releases](https://github.com/azfoundary/burnrate-adapter/releases/latest).
 2. In your own BurnRate, go to **Settings ▸ Adapter** and download
    `burnrate-adapter.json`. It already contains your address and key.
 3. Put both files in one folder and run the adapter.
@@ -63,6 +63,20 @@ No `cf_clearance` cookie handling, no headless-browser challenge solving, no
 fingerprint spoofing. The protection is doing its job; this program works
 because it runs somewhere requests are accepted on their own merits, not
 because it pretends to be something it is not.
+
+## Adding another service
+
+MoneyLover is not unusual — plenty of consumer tools have no API and no plans
+for one. The shape here is meant to survive that: the adapter's own half (the
+queue protocol, the config file, the heartbeat, the three-way reporting of what
+happened to each row) knows nothing about MoneyLover, and everything that does
+lives in `moneylover/`.
+
+What is deliberately **not** here is an interface with one implementation. A
+second service is what reveals where the seam actually belongs; guessing at it
+from one produces a shape that fits nothing. The config file carries a
+`service` field so that files already sitting in people's Downloads folders can
+be told apart later, and that is the whole of the preparation.
 
 ## Licence
 
