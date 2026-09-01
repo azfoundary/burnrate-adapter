@@ -50,6 +50,12 @@ It asks for your MoneyLover email and password once, checks that writes from
 your computer actually reach MoneyLover, offers to start itself when you log
 in, and then checks for work every 60 seconds.
 
+MoneyLover sessions last about an hour and there is no way to renew one without
+the password, which is never stored. So the adapter asks you to sign in again
+when it lapses. If it is running in a window it asks there and carries on; if it
+was started at login with no window, it stops and says so, rather than staying
+up looking healthy while nothing can be written.
+
 **Your computer will warn about an unsigned download the first time.** On macOS
 right-click the file and choose Open, then Open again. On Windows click
 **More info**, then **Run anyway**. Signing removes these and costs a few

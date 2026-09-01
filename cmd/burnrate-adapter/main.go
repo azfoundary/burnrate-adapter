@@ -131,13 +131,43 @@ func runAdapter(args []string) error {
 	fmt.Printf("\n  BurnRate Adapter %s\n", adapterVersion)
 	fmt.Printf("  Connected to %s\n\n", short(cfg.Server))
 
+	saidFrozen := false
 	for {
-		if err := beat(ctx, cfg); err != nil {
+		frozen, err := beat(ctx, cfg)
+		switch {
+		case err != nil:
 			fmt.Fprintf(os.Stderr, "  can't reach BurnRate: %v\n", err)
-		} else if n, err := adapterPass(ctx, ml, cfg, *limit); err != nil {
-			fmt.Fprintf(os.Stderr, "  %v\n", err)
-		} else if n > 0 {
-			fmt.Printf("  Wrote %d. Waiting.\n", n)
+		case frozen:
+			if !saidFrozen {
+				fmt.Println("  BurnRate has paused writing, so there is nothing to send.")
+				fmt.Println("  Clear it in BurnRate; this keeps checking and resumes on its own.")
+				saidFrozen = true
+			}
+		default:
+			saidFrozen = false
+			n, passErr := adapterPass(ctx, ml, cfg, *limit)
+			switch {
+			case errors.Is(passErr, errSessionExpired):
+				fmt.Fprintln(os.Stderr, "\n  Your MoneyLover session has expired. Nothing was written,")
+				fmt.Fprintln(os.Stderr, "  and no transaction has been changed.")
+				if !term.IsTerminal(int(syscall.Stdin)) {
+					// Started at login, with no window to type into. Exiting is
+					// the honest move: staying up keeps the heartbeat green
+					// while nothing can ever be written.
+					fmt.Fprintln(os.Stderr, "  Start the adapter from a window so it can ask you to sign in again.")
+					return errSessionExpired
+				}
+				newML, signInErr := signIn(ctx, cfgPath, cfg)
+				if signInErr != nil {
+					return signInErr
+				}
+				ml = newML
+				continue
+			case passErr != nil:
+				fmt.Fprintf(os.Stderr, "  %v\n", passErr)
+			case n > 0:
+				fmt.Printf("  Wrote %d. Waiting.\n", n)
+			}
 		}
 		if *once {
 			return nil
@@ -291,22 +321,84 @@ func adapterPass(ctx context.Context, ml *moneylover.Client, cfg adapterConfig, 
 	}
 	results := make([]adapterResult, 0, len(rows))
 	wrote := 0
-	for _, r := range rows {
+	expired := false
+	for i, r := range rows {
 		err := ml.AddTransaction(ctx, r.WalletID, r.CategoryID, r.Amount, r.Note, r.Date, r.Gid)
+		results = append(results, classify(r.TxnID, err))
 		switch {
 		case err == nil:
 			fmt.Printf("  wrote #%d  %.2f %s  %s\n", r.TxnID, r.Amount, r.Currency, r.Note)
-			results = append(results, adapterResult{TxnID: r.TxnID, OK: true, Landed: true})
 			wrote++
+		case errors.Is(err, moneylover.ErrAuth):
+			// Nothing was sent. loginLocked refuses before it builds a request
+			// when there is no password, which is EVERY run resumed from a
+			// cached session: the client is constructed with "" and there is
+			// no refresh grant, so an hour in, this is the state.
+			//
+			// Calling that "may have landed" was the worst answer available.
+			// Real money stays out of the wallet, each row is held four hours,
+			// and held rows drop off the only list that shows them — so the
+			// operator sees a green "running" pill and a promise that the rows
+			// write within a minute, indefinitely.
+			fmt.Fprintf(os.Stderr, "  #%d not written - the MoneyLover session has expired\n", r.TxnID)
+			expired = true
 		case errors.Is(err, moneylover.ErrBotChallenge):
 			fmt.Fprintf(os.Stderr, "  #%d was blocked before it reached MoneyLover\n", r.TxnID)
-			results = append(results, adapterResult{TxnID: r.TxnID, Landed: false, Error: err.Error()})
 		default:
+			// Everything else stays "may have landed" deliberately: a timeout
+			// in flight cannot be told from a refusal, and holding a row that
+			// was written beats writing one twice.
 			fmt.Fprintf(os.Stderr, "  #%d failed: %v\n", r.TxnID, err)
-			results = append(results, adapterResult{TxnID: r.TxnID, Landed: true, Error: err.Error()})
+		}
+		if expired {
+			// The rest of the batch fails the same way and none of it is sent.
+			// Marching it through would quarantine the whole backlog.
+			for _, rest := range rows[i+1:] {
+				results = append(results, adapterResult{
+					TxnID: rest.TxnID,
+					Error: "not attempted: the MoneyLover session expired earlier in this batch",
+				})
+			}
+			break
 		}
 	}
-	return wrote, report(ctx, cfg, results)
+	if err := report(ctx, cfg, results); err != nil {
+		return wrote, err
+	}
+	if expired {
+		return wrote, errSessionExpired
+	}
+	return wrote, nil
+}
+
+// errSessionExpired says the cached MoneyLover session has lapsed and this
+// process holds no password to renew it with. Signing in again is the only
+// way forward, so the loop stops asking for work rather than pulling the
+// backlog through a client that cannot send it.
+var errSessionExpired = errors.New("the MoneyLover session has expired")
+
+// classify turns a write error into what BurnRate is told, and it is the only
+// place that decides it.
+//
+// "Landed" does not mean success — it means the request may have reached
+// MoneyLover, so BurnRate must hold the row rather than send it again. The
+// default is deliberately Landed: a timeout in flight cannot be told from a
+// refusal, and holding a row that was written beats writing one twice.
+//
+// The two exceptions are the cases where nothing was sent and we know it:
+// ErrAuth is returned before a request is even built when the client has no
+// password, and a bot challenge is Cloudflare answering instead of MoneyLover.
+// Reporting those as Landed strands real money outside the wallet for four
+// hours a row while every page reports the adapter healthy.
+func classify(txnID int64, err error) adapterResult {
+	switch {
+	case err == nil:
+		return adapterResult{TxnID: txnID, OK: true, Landed: true}
+	case errors.Is(err, moneylover.ErrAuth), errors.Is(err, moneylover.ErrBotChallenge):
+		return adapterResult{TxnID: txnID, Landed: false, Error: err.Error()}
+	default:
+		return adapterResult{TxnID: txnID, Landed: true, Error: err.Error()}
+	}
 }
 
 func fetchQueue(ctx context.Context, cfg adapterConfig, limit int) ([]adapterRow, error) {
@@ -340,11 +432,25 @@ func report(ctx context.Context, cfg adapterConfig, results []adapterResult) err
 	return nil
 }
 
-func beat(ctx context.Context, cfg adapterConfig) error {
+// beat reports in and returns whether BurnRate has paused writing.
+//
+// The answer used to be discarded. A frozen ledger then meant the queue
+// answered 409 every minute, the adapter printed one opaque line and slept,
+// and the settings page went on showing a green "running" pill beside rows it
+// promised would be written "within about a minute" - every statement true
+// about the adapter, and every one the wrong answer to the operator's question.
+func beat(ctx context.Context, cfg adapterConfig) (bool, error) {
 	host, _ := os.Hostname()
 	payload, _ := json.Marshal(map[string]any{"version": adapterVersion, "host": host})
-	_, err := call(ctx, cfg, http.MethodPost, cfg.Server+"/api/adapter/heartbeat", payload)
-	return err
+	body, err := call(ctx, cfg, http.MethodPost, cfg.Server+"/api/adapter/heartbeat", payload)
+	if err != nil {
+		return false, err
+	}
+	var out struct {
+		Frozen bool `json:"frozen"`
+	}
+	_ = json.Unmarshal(body, &out)
+	return out.Frozen, nil
 }
 
 func call(ctx context.Context, cfg adapterConfig, method, url string, body []byte) ([]byte, error) {
