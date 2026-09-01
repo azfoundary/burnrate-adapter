@@ -51,9 +51,26 @@ nothing to type.
 It asks for nothing. It checks for work every 60 seconds, and each batch
 arrives with the session it needs.
 
-It runs in a terminal window and that window has to stay open — there is no
-autostart yet, so after a restart you start it again yourself. A version that
-sits in the notification area and starts at login is being built.
+**On Windows** it runs in the notification area, by the clock. No window. The
+icon's colour is the status — green reaching BurnRate, amber BurnRate has
+paused writing, red cannot reach it — and right-clicking gives you *Check for
+work now*, *Start when I log in*, *Show log* and *Quit*.
+
+**On macOS and Linux** it is still a terminal window that has to stay open. A
+tray on those needs a different toolkit each, and both need CGO, which would
+break the single cross-compiled build that produces all four binaries.
+
+Either way it only writes while it is running and the computer is awake.
+Quitting it loses nothing: confirmed rows queue in BurnRate until it is back.
+
+### Running it in a window anyway
+
+    burnrate-adapter --console      # print to this terminal instead of the tray
+    burnrate-adapter --once         # one pass, then stop
+
+On Windows these attach to the terminal you launched them from. The binary is
+linked as a GUI application so that double-clicking it opens no black window,
+which also means it has no console of its own until it asks for one.
 
 MoneyLover sessions last about an hour and there is no way to renew one without
 the password, which is never stored. So the adapter asks you to sign in again

@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.1.0"
+const adapterVersion = "1.2.0"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -92,8 +92,49 @@ func (localSettings) GetSetting(string) (string, error) { return "", nil }
 func main() {
 	log.SetFlags(0)
 	if err := runAdapter(os.Args[1:]); err != nil {
-		log.Fatalf("burnrate-adapter: %v", err)
+		// reportFatal, not log.Fatalf. On Windows this process may have no
+		// console at all, and writing the reason into a dead handle is how a
+		// missing settings file became "it does nothing when I double-click
+		// it" with no diagnosis available anywhere.
+		reportFatal(err.Error())
+		os.Exit(1)
 	}
+}
+
+// state is what the adapter is doing, in the four kinds a person cares about.
+// The console prints them; the tray colours an icon with them.
+type state int
+
+const (
+	stateIdle    state = iota // reaching BurnRate, nothing waiting
+	stateWorking              // writing a batch right now
+	stateOffline              // cannot reach BurnRate at all
+	statePaused               // BurnRate has frozen writes
+)
+
+// ui is how the loop reports itself. Deliberately narrow: the loop decides
+// what is happening, and the two front ends decide only how to show it.
+//
+// Without this the loop printed straight to stdout, which is invisible in a
+// windowsgui build — the tray would have been a second copy of the loop, and
+// two copies of "when may a row be written" is exactly the duplication this
+// program exists to avoid.
+type ui interface {
+	Set(s state, detail string)
+	Wrote(n int)
+	Logf(format string, args ...any)
+}
+
+// loopOpts are the knobs both front ends share.
+type loopOpts struct {
+	every time.Duration
+	once  bool
+	limit int
+	// now fires a pass immediately, without waiting out the interval. The
+	// tray's "Write now" sends on it.
+	now <-chan struct{}
+	// stop ends the loop; the tray's Quit closes it.
+	stop <-chan struct{}
 }
 
 func runAdapter(args []string) error {
@@ -102,8 +143,21 @@ func runAdapter(args []string) error {
 	once := fs.Bool("once", false, "do one pass and stop")
 	limit := fs.Int("limit", 0, "write at most this many rows in one pass")
 	probe := fs.Bool("probe", false, "check whether writes from this computer reach MoneyLover, and create nothing")
+	console := fs.Bool("console", false, "run in this window instead of the notification area")
+	// Windows passes this from the login entry setAutostart writes. It exists
+	// so the flag parser accepts it: an unknown flag is a parse error, which
+	// would mean the adapter dies instantly at every login, having been
+	// started by a line the adapter itself wrote.
+	fs.Bool("autostart", false, "started automatically at login")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// Anything that talks back to the operator needs somewhere to talk. A
+	// windowsgui build has no console of its own, so one is attached before
+	// the first line is printed.
+	if *probe || *once || *console {
+		attachConsole()
 	}
 
 	_, cfg, err := loadAdapterConfig()
@@ -117,38 +171,71 @@ func runAdapter(args []string) error {
 		if terr != nil {
 			return terr
 		}
-		return adapterProbe(ctx, moneylover.NewWithToken(tok))
+		probeML := moneylover.NewWithToken(tok)
+		// Without this the freeze guard in AddTransaction refuses before a
+		// request is built, and the refusal lands in adapterProbe's "it
+		// answered on the merits" branch: the one command whose job is to
+		// prove writes leave this machine would pass without sending a byte.
+		probeML.SetSettings(localSettings{})
+		return adapterProbe(ctx, probeML)
 	}
 
-	fmt.Printf("\n  BurnRate Adapter %s\n", adapterVersion)
-	fmt.Printf("  Connected to %s\n\n", short(cfg.Server))
+	opts := loopOpts{every: *every, once: *once, limit: *limit}
+	if *console || *once {
+		return runLoop(ctx, cfg, opts, newConsoleUI(cfg))
+	}
+	if alreadyRunning() {
+		// Not an error worth a dialog: the operator wanted the adapter
+		// running, and it is.
+		return nil
+	}
+	return launch(ctx, cfg, opts)
+}
 
+// runLoop is the adapter, and the only place that decides when work happens.
+func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
 	saidFrozen := false
 	for {
 		frozen, err := beat(ctx, cfg)
 		switch {
 		case err != nil:
-			fmt.Fprintf(os.Stderr, "  can't reach BurnRate: %v\n", err)
+			u.Set(stateOffline, "Can't reach BurnRate")
+			u.Logf("can't reach BurnRate: %v", err)
 		case frozen:
+			u.Set(statePaused, "BurnRate has paused writing")
 			if !saidFrozen {
-				fmt.Println("  BurnRate has paused writing, so there is nothing to send.")
-				fmt.Println("  Clear it in BurnRate; this keeps checking and resumes on its own.")
+				u.Logf("BurnRate has paused writing, so there is nothing to send.")
+				u.Logf("Clear it in BurnRate; this keeps checking and resumes on its own.")
 				saidFrozen = true
 			}
 		default:
 			saidFrozen = false
-			n, passErr := adapterPass(ctx, cfg, *limit)
+			u.Set(stateWorking, "Checking for work")
+			n, failed, passErr := adapterPass(ctx, cfg, o.limit, u)
 			switch {
 			case passErr != nil:
-				fmt.Fprintf(os.Stderr, "  %v\n", passErr)
-			case n > 0:
-				fmt.Printf("  Wrote %d. Waiting.\n", n)
+				u.Set(stateOffline, "Last attempt failed")
+				u.Logf("%v", passErr)
+			case failed > 0:
+				u.Set(stateOffline, fmt.Sprintf("%d could not be written", failed))
+			default:
+				u.Set(stateIdle, "Up to date")
+			}
+			if n > 0 {
+				u.Wrote(n)
 			}
 		}
-		if *once {
+		if o.once {
 			return nil
 		}
-		time.Sleep(*every)
+		select {
+		case <-time.After(o.every):
+		case <-o.now:
+		case <-o.stop:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -241,6 +328,14 @@ func adapterProbe(ctx context.Context, ml *moneylover.Client) error {
 		fmt.Println("\n  Reached MoneyLover — and it accepted an invalid write, which is odd.")
 		fmt.Println("  Writes get through, but check the wallet before relying on it.")
 		return nil
+	case errors.Is(err, moneylover.ErrAuth):
+		// Refused before anything was sent, so it says nothing at all about
+		// whether writes from this computer arrive. Calling it success is
+		// worse than failing: the operator would stop looking.
+		fmt.Printf("\n  Could not test: %v\n", err)
+		fmt.Println("  Nothing was sent, so this says nothing about whether writes from")
+		fmt.Println("  this computer get through. Check the MoneyLover login in BurnRate.")
+		return err
 	default:
 		fmt.Printf("\n  Reached MoneyLover. It answered: %v\n", err)
 		fmt.Println("  That is the good outcome: the request arrived and was refused on its")
@@ -249,10 +344,10 @@ func adapterProbe(ctx context.Context, ml *moneylover.Client) error {
 	}
 }
 
-func adapterPass(ctx context.Context, cfg adapterConfig, limit int) (int, error) {
+func adapterPass(ctx context.Context, cfg adapterConfig, limit int, u ui) (wroteN, failedN int, err error) {
 	rows, token, err := fetchQueue(ctx, cfg, limit)
 	if err != nil || len(rows) == 0 {
-		return 0, err
+		return 0, 0, err
 	}
 	// A client for this batch and no longer. It holds the token BurnRate sent
 	// and nothing else - no login, no password, nothing on disk.
@@ -266,7 +361,7 @@ func adapterPass(ctx context.Context, cfg adapterConfig, limit int) (int, error)
 		results = append(results, classify(r.TxnID, err))
 		switch {
 		case err == nil:
-			fmt.Printf("  wrote #%d  %.2f %s  %s\n", r.TxnID, r.Amount, r.Currency, r.Note)
+			u.Logf("wrote #%d  %.2f %s  %s", r.TxnID, r.Amount, r.Currency, r.Note)
 			wrote++
 		case errors.Is(err, moneylover.ErrAuth):
 			// MoneyLover refused the token BurnRate lent for this batch, so
@@ -278,15 +373,15 @@ func adapterPass(ctx context.Context, cfg adapterConfig, limit int) (int, error)
 			// the wallet, each row is held four hours, and held rows drop off
 			// the only list that shows them, so the operator sees a green
 			// "running" pill and a promise that never comes true.
-			fmt.Fprintf(os.Stderr, "  #%d not written - BurnRate's MoneyLover session was refused\n", r.TxnID)
+			u.Logf("#%d not written - BurnRate's MoneyLover session was refused", r.TxnID)
 			expired = true
 		case errors.Is(err, moneylover.ErrBotChallenge):
-			fmt.Fprintf(os.Stderr, "  #%d was blocked before it reached MoneyLover\n", r.TxnID)
+			u.Logf("#%d was blocked before it reached MoneyLover", r.TxnID)
 		default:
 			// Everything else stays "may have landed" deliberately: a timeout
 			// in flight cannot be told from a refusal, and holding a row that
 			// was written beats writing one twice.
-			fmt.Fprintf(os.Stderr, "  #%d failed: %v\n", r.TxnID, err)
+			u.Logf("#%d failed: %v", r.TxnID, err)
 		}
 		if expired {
 			// The rest of the batch fails the same way and none of it is sent.
@@ -300,13 +395,24 @@ func adapterPass(ctx context.Context, cfg adapterConfig, limit int) (int, error)
 			break
 		}
 	}
+	// Rows that did not get written are counted and returned, not merely
+	// logged. Reporting only successes made a batch where MoneyLover refused
+	// every row indistinguishable from an empty queue - so the tray painted
+	// itself calm green and said "Up to date" while nothing was being written,
+	// which is the exact failure a status icon exists to prevent.
+	failed := 0
+	for _, r := range results {
+		if !r.OK {
+			failed++
+		}
+	}
 	if err := report(ctx, cfg, results); err != nil {
-		return wrote, err
+		return wrote, failed, err
 	}
 	if expired {
-		return wrote, errSessionExpired
+		return wrote, failed, errSessionExpired
 	}
-	return wrote, nil
+	return wrote, failed, nil
 }
 
 // errSessionExpired says MoneyLover refused the token BurnRate lent for this
