@@ -47,8 +47,12 @@ server.
    its settings beside itself, so the folder is the only thing that matters.
 
 It asks for your MoneyLover email and password once, checks that writes from
-your computer actually reach MoneyLover, offers to start itself when you log
-in, and then checks for work every 60 seconds.
+your computer actually reach MoneyLover, and then checks for work every 60
+seconds.
+
+It runs in a terminal window and that window has to stay open — there is no
+autostart yet, so after a restart you start it again yourself. A version that
+sits in the notification area and starts at login is being built.
 
 MoneyLover sessions last about an hour and there is no way to renew one without
 the password, which is never stored. So the adapter asks you to sign in again
