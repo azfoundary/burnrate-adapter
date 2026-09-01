@@ -467,6 +467,51 @@ func (c *Client) do(ctx context.Context, path string, body any) (json.RawMessage
 // cached scheme preference twice and silently broke every read for days.
 // A denied/hanging call must surface as an error, never fall through to a
 // scheme that fabricates empty success.
+// RawRead makes one authenticated read and returns the response body EXACTLY
+// as MoneyLover sent it.
+//
+// Raw on purpose. BurnRate composed this request and BurnRate parses the
+// answer; this program signs in, sends and returns bytes. Parsing here would
+// put a second opinion about what a wallet row means on a machine BurnRate
+// cannot see or update, and the two would drift the first time either changed.
+//
+// It also means a MoneyLover refusal arrives at BurnRate as a refusal.
+// MoneyLover reports failure inside a 200 body, so an adapter that inspected
+// the envelope and returned "no rows" would have BurnRate read a refusal as an
+// empty wallet — which its canary treats as the wallet disagreeing with the
+// ledger, and freezes writes over.
+func (c *Client) RawRead(ctx context.Context, path string, payload []byte) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ensureTokenLocked(ctx); err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	status, body, err := c.httpPost(ctx, c.apiBase+path, payload,
+		map[string]string{"Authorization": schemeAuthJWT + " " + c.accessToken})
+	if err != nil {
+		return nil, fmt.Errorf("moneylover: %s: %w", path, err)
+	}
+	if status == http.StatusUnauthorized {
+		// One re-login, matching the direct path. A token that lapsed between
+		// two reads is ordinary, not a failure worth propagating.
+		c.accessToken = ""
+		if err := c.loginLocked(ctx); err != nil {
+			return nil, err
+		}
+		if status, body, err = c.httpPost(ctx, c.apiBase+path, payload,
+			map[string]string{"Authorization": schemeAuthJWT + " " + c.accessToken}); err != nil {
+			return nil, fmt.Errorf("moneylover: %s: %w", path, err)
+		}
+	}
+	if status/100 != 2 {
+		return nil, fmt.Errorf("moneylover: %s: HTTP %d: %s", path, status, snippet(body))
+	}
+	return body, nil
+}
+
 func (c *Client) apiPostLocked(ctx context.Context, path string, body any, allowRelogin bool) (json.RawMessage, error) {
 	if err := c.ensureTokenLocked(ctx); err != nil {
 		return nil, err

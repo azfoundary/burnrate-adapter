@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"fyne.io/systray"
@@ -96,6 +98,9 @@ func launch(ctx context.Context, cfg adapterConfig, o loopOpts) error {
 		writeNow := systray.AddMenuItem("Check for work now", "Look for entries to write without waiting")
 		open := systray.AddMenuItem("Open BurnRate", "Open the ledger in your browser")
 		systray.AddSeparator()
+		signIn := systray.AddMenuItem("Sign in to MoneyLover…", "Save a MoneyLover login on this computer, for reading your wallet")
+		signOut := systray.AddMenuItem("Forget the saved MoneyLover login", "Remove it from this computer")
+		systray.AddSeparator()
 		atLogin := systray.AddMenuItemCheckbox("Start when I log in", "Run the adapter automatically", autostartEnabled())
 		showLog := systray.AddMenuItem("Show log", "Open the file recording what the adapter has done")
 		systray.AddSeparator()
@@ -132,6 +137,15 @@ func launch(ctx context.Context, cfg adapterConfig, o loopOpts) error {
 					} else {
 						atLogin.Uncheck()
 					}
+				case <-signIn.ClickedCh:
+					// A console, not a dialog. A tray program has no window to
+					// type a password into, and building one means a GUI
+					// toolkit and CGO — which would end the single build that
+					// produces all four platforms. Launching the same binary
+					// with --signin is a lot less machinery for the same job.
+					runSelf("--signin")
+				case <-signOut.ClickedCh:
+					runSelf("--signout")
 				case <-showLog.ClickedCh:
 					openInBrowser(log.Path())
 				case <-quitItem.ClickedCh:
@@ -175,6 +189,21 @@ func launch(ctx context.Context, cfg adapterConfig, o loopOpts) error {
 // The old twenty seconds was shorter than a single slow write, so the wait
 // looked like a safeguard while reliably expiring.
 const settleWindow = 2 * time.Minute
+
+// runSelf starts this same binary in a console window.
+//
+// CREATE_NEW_CONSOLE because the tray build is linked -H windowsgui and has no
+// console to inherit: without it the child would prompt for a password into
+// nothing, and the operator would watch a window flash and vanish.
+func runSelf(args ...string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000010} // CREATE_NEW_CONSOLE
+	_ = cmd.Start()
+}
 
 func openInBrowser(target string) {
 	if target == "" {

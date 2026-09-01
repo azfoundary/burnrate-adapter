@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.2.0"
+const adapterVersion = "1.3.0"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -144,6 +144,8 @@ func runAdapter(args []string) error {
 	limit := fs.Int("limit", 0, "write at most this many rows in one pass")
 	probe := fs.Bool("probe", false, "check whether writes from this computer reach MoneyLover, and create nothing")
 	console := fs.Bool("console", false, "run in this window instead of the notification area")
+	signin := fs.Bool("signin", false, "save a MoneyLover login on this computer, for reading your wallet")
+	signout := fs.Bool("signout", false, "remove the MoneyLover login saved on this computer")
 	// Windows passes this from the login entry setAutostart writes. It exists
 	// so the flag parser accepts it: an unknown flag is a parse error, which
 	// would mean the adapter dies instantly at every login, having been
@@ -158,6 +160,14 @@ func runAdapter(args []string) error {
 	// the first line is printed.
 	if *probe || *once || *console {
 		attachConsole()
+	}
+	// These two only touch this computer, so neither needs the settings file
+	// and neither should fail for want of one.
+	if *signin {
+		return runSignIn(context.Background())
+	}
+	if *signout {
+		return runSignOut()
 	}
 
 	_, cfg, err := loadAdapterConfig()
@@ -194,6 +204,7 @@ func runAdapter(args []string) error {
 
 // runLoop is the adapter, and the only place that decides when work happens.
 func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
+	rd := &reader{}
 	saidFrozen := false
 	for {
 		frozen, err := beat(ctx, cfg)
@@ -211,6 +222,17 @@ func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
 		default:
 			saidFrozen = false
 			u.Set(stateWorking, "Checking for work")
+
+			// Wallet reads first. When the operator keeps their MoneyLover
+			// login here, BurnRate cannot read the wallet at all until this
+			// runs — and the writes below depend on what those reads settle.
+			if reads, rerr := serveReads(ctx, cfg, rd, u); rerr != nil {
+				u.Set(stateOffline, "Cannot read your wallet")
+				u.Logf("wallet reads: %v", rerr)
+			} else if reads > 0 {
+				u.Logf("made %d wallet read(s) for BurnRate", reads)
+			}
+
 			n, failed, passErr := adapterPass(ctx, cfg, o.limit, u)
 			switch {
 			case passErr != nil:
