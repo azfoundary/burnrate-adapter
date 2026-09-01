@@ -18,7 +18,6 @@ package main
 // their machine. No MoneyLover credential ever reaches the BurnRate server.
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -32,10 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
-
-	"golang.org/x/term"
 
 	"github.com/azfoundary/burnrate-adapter/moneylover"
 )
@@ -43,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.0.1"
+const adapterVersion = "1.1.0"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -63,10 +59,6 @@ type adapterConfig struct {
 	// second service is what would reveal the right shape and guessing at it
 	// from one implementation produces the wrong seam.
 	Service string `json:"service,omitempty"`
-	// Email is remembered after the first run so only the password is asked
-	// for when a MoneyLover session expires. The password is never written
-	// here, or anywhere.
-	Email string `json:"moneylover_email,omitempty"`
 }
 
 type adapterRow struct {
@@ -114,18 +106,18 @@ func runAdapter(args []string) error {
 		return err
 	}
 
-	cfgPath, cfg, err := loadAdapterConfig()
-	if err != nil && !*probe {
+	_, cfg, err := loadAdapterConfig()
+	if err != nil {
 		return err
 	}
 	ctx := context.Background()
 
-	ml, err := signIn(ctx, cfgPath, cfg)
-	if err != nil {
-		return err
-	}
 	if *probe {
-		return adapterProbe(ctx, ml)
+		tok, terr := fetchWriteToken(ctx, cfg)
+		if terr != nil {
+			return terr
+		}
+		return adapterProbe(ctx, moneylover.NewWithToken(tok))
 	}
 
 	fmt.Printf("\n  BurnRate Adapter %s\n", adapterVersion)
@@ -145,24 +137,8 @@ func runAdapter(args []string) error {
 			}
 		default:
 			saidFrozen = false
-			n, passErr := adapterPass(ctx, ml, cfg, *limit)
+			n, passErr := adapterPass(ctx, cfg, *limit)
 			switch {
-			case errors.Is(passErr, errSessionExpired):
-				fmt.Fprintln(os.Stderr, "\n  Your MoneyLover session has expired. Nothing was written,")
-				fmt.Fprintln(os.Stderr, "  and no transaction has been changed.")
-				if !term.IsTerminal(int(syscall.Stdin)) {
-					// Started at login, with no window to type into. Exiting is
-					// the honest move: staying up keeps the heartbeat green
-					// while nothing can ever be written.
-					fmt.Fprintln(os.Stderr, "  Start the adapter from a window so it can ask you to sign in again.")
-					return errSessionExpired
-				}
-				newML, signInErr := signIn(ctx, cfgPath, cfg)
-				if signInErr != nil {
-					return signInErr
-				}
-				ml = newML
-				continue
 			case passErr != nil:
 				fmt.Fprintf(os.Stderr, "  %v\n", passErr)
 			case n > 0:
@@ -219,66 +195,25 @@ func loadAdapterConfig() (string, adapterConfig, error) {
 // The password is read without echo and used once. Only the session token is
 // kept: a password stored to avoid asking again is a password that outlives
 // the reason for having it.
-func signIn(ctx context.Context, cfgPath string, cfg adapterConfig) (*moneylover.Client, error) {
-	home, _ := os.UserHomeDir()
-	sessionPath := filepath.Join(home, ".burnrate-adapter-session.json")
-
-	email := cfg.Email
-	if v := os.Getenv("ML_EMAIL"); v != "" {
-		email = v
-	}
-	pass := os.Getenv("ML_PASSWORD")
-
-	// A cached session means neither is needed. Try it before asking.
-	if pass == "" && email != "" {
-		if _, err := os.Stat(sessionPath); err == nil {
-			ml := moneylover.New(email, "", sessionPath)
-			ml.SetSettings(localSettings{})
-			if _, err := ml.ListWallets(ctx); err == nil {
-				return ml, nil
-			}
-			fmt.Println("  Your MoneyLover session has expired.")
-		}
-	}
-	if email == "" {
-		email = prompt("  MoneyLover email: ")
-	}
-	if pass == "" {
-		pass = promptSecret("  MoneyLover password: ")
-	}
-	ml := moneylover.New(email, pass, sessionPath)
-	ml.SetSettings(localSettings{})
-	if _, err := ml.ListWallets(ctx); err != nil {
-		return nil, fmt.Errorf("signing in to MoneyLover: %w", err)
-	}
-	fmt.Println("  Signed in. You will not be asked again until this expires.")
-	// Remember the email so only the password is needed next time.
-	if cfgPath != "" && cfg.Email != email {
-		cfg.Email = email
-		if b, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-			_ = os.WriteFile(cfgPath, b, 0o600)
-		}
-	}
-	return ml, nil
-}
-
-func prompt(label string) string {
-	fmt.Print(label)
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	return strings.TrimSpace(line)
-}
-
-// promptSecret reads without echoing. A password typed onto a visible line
-// ends up in screenshots and scrollback, which is exactly how one was exposed
-// while this was being built.
-func promptSecret(label string) string {
-	fmt.Print(label)
-	b, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Println()
+// fetchWriteToken asks BurnRate for a MoneyLover access token.
+//
+// Only --probe needs this: a normal pass gets its token with the batch it is
+// about to write, so an idle adapter never causes a sign-in at all.
+func fetchWriteToken(ctx context.Context, cfg adapterConfig) (string, error) {
+	body, err := call(ctx, cfg, http.MethodGet, cfg.Server+"/api/adapter/token", nil)
 	if err != nil {
-		return prompt("")
+		return "", fmt.Errorf("asking BurnRate for a MoneyLover token: %w", err)
 	}
-	return strings.TrimSpace(string(b))
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("asking BurnRate for a MoneyLover token: %w", err)
+	}
+	if out.Token == "" {
+		return "", errors.New("BurnRate has no MoneyLover session to lend - check the MoneyLover login saved in BurnRate")
+	}
+	return out.Token, nil
 }
 
 // adapterProbe answers whether a WRITE from this computer reaches MoneyLover,
@@ -314,11 +249,15 @@ func adapterProbe(ctx context.Context, ml *moneylover.Client) error {
 	}
 }
 
-func adapterPass(ctx context.Context, ml *moneylover.Client, cfg adapterConfig, limit int) (int, error) {
-	rows, err := fetchQueue(ctx, cfg, limit)
+func adapterPass(ctx context.Context, cfg adapterConfig, limit int) (int, error) {
+	rows, token, err := fetchQueue(ctx, cfg, limit)
 	if err != nil || len(rows) == 0 {
 		return 0, err
 	}
+	// A client for this batch and no longer. It holds the token BurnRate sent
+	// and nothing else - no login, no password, nothing on disk.
+	ml := moneylover.NewWithToken(token)
+	ml.SetSettings(localSettings{})
 	results := make([]adapterResult, 0, len(rows))
 	wrote := 0
 	expired := false
@@ -330,17 +269,16 @@ func adapterPass(ctx context.Context, ml *moneylover.Client, cfg adapterConfig, 
 			fmt.Printf("  wrote #%d  %.2f %s  %s\n", r.TxnID, r.Amount, r.Currency, r.Note)
 			wrote++
 		case errors.Is(err, moneylover.ErrAuth):
-			// Nothing was sent. loginLocked refuses before it builds a request
-			// when there is no password, which is EVERY run resumed from a
-			// cached session: the client is constructed with "" and there is
-			// no refresh grant, so an hour in, this is the state.
+			// MoneyLover refused the token BurnRate lent for this batch, so
+			// nothing was sent. Not something this program can fix: it holds
+			// no credentials, and a fresh token arrives with the next batch.
 			//
-			// Calling that "may have landed" was the worst answer available.
-			// Real money stays out of the wallet, each row is held four hours,
-			// and held rows drop off the only list that shows them — so the
-			// operator sees a green "running" pill and a promise that the rows
-			// write within a minute, indefinitely.
-			fmt.Fprintf(os.Stderr, "  #%d not written - the MoneyLover session has expired\n", r.TxnID)
+			// It must still be reported as unwritten. Calling it "may have
+			// landed" is the worst answer available - the money stays out of
+			// the wallet, each row is held four hours, and held rows drop off
+			// the only list that shows them, so the operator sees a green
+			// "running" pill and a promise that never comes true.
+			fmt.Fprintf(os.Stderr, "  #%d not written - BurnRate's MoneyLover session was refused\n", r.TxnID)
 			expired = true
 		case errors.Is(err, moneylover.ErrBotChallenge):
 			fmt.Fprintf(os.Stderr, "  #%d was blocked before it reached MoneyLover\n", r.TxnID)
@@ -356,7 +294,7 @@ func adapterPass(ctx context.Context, ml *moneylover.Client, cfg adapterConfig, 
 			for _, rest := range rows[i+1:] {
 				results = append(results, adapterResult{
 					TxnID: rest.TxnID,
-					Error: "not attempted: the MoneyLover session expired earlier in this batch",
+					Error: "not attempted: the MoneyLover session was refused earlier in this batch",
 				})
 			}
 			break
@@ -371,11 +309,11 @@ func adapterPass(ctx context.Context, ml *moneylover.Client, cfg adapterConfig, 
 	return wrote, nil
 }
 
-// errSessionExpired says the cached MoneyLover session has lapsed and this
-// process holds no password to renew it with. Signing in again is the only
-// way forward, so the loop stops asking for work rather than pulling the
-// backlog through a client that cannot send it.
-var errSessionExpired = errors.New("the MoneyLover session has expired")
+// errSessionExpired says MoneyLover refused the token BurnRate lent for this
+// batch. The rest of the batch would fail identically, so the pass stops
+// rather than pulling the whole backlog through a token that is not working.
+// The next pass gets a fresh one, so this recovers on its own.
+var errSessionExpired = errors.New("BurnRate's MoneyLover session was refused")
 
 // classify turns a write error into what BurnRate is told, and it is the only
 // place that decides it.
@@ -401,22 +339,33 @@ func classify(txnID int64, err error) adapterResult {
 	}
 }
 
-func fetchQueue(ctx context.Context, cfg adapterConfig, limit int) ([]adapterRow, error) {
+// fetchQueue returns the rows to write and the MoneyLover token to write them
+// with. The token comes WITH the batch rather than being held between passes:
+// it is the credential for someone's real wallet, so it lives in this process
+// for as long as one batch takes and no longer.
+func fetchQueue(ctx context.Context, cfg adapterConfig, limit int) ([]adapterRow, string, error) {
 	u := cfg.Server + "/api/adapter/queue"
 	if limit > 0 {
 		u += "?limit=" + strconv.Itoa(limit)
 	}
 	body, err := call(ctx, cfg, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var out struct {
-		Rows []adapterRow `json:"rows"`
+		Rows  []adapterRow `json:"rows"`
+		Token string       `json:"token"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("queue: %w", err)
+		return nil, "", fmt.Errorf("queue: %w", err)
 	}
-	return out.Rows, nil
+	if len(out.Rows) > 0 && out.Token == "" {
+		// Refusing beats attempting: BurnRate has already marked these rows as
+		// in flight, and a batch sent with no token would fail every row and
+		// hold each one for four hours.
+		return nil, "", errors.New("BurnRate sent work but no MoneyLover token - update BurnRate")
+	}
+	return out.Rows, out.Token, nil
 }
 
 func report(ctx context.Context, cfg adapterConfig, results []adapterResult) error {

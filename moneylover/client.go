@@ -191,6 +191,29 @@ func New(email, password, tokenCachePath string) *Client {
 	return c
 }
 
+// NewWithToken builds a client that can only transmit.
+//
+// It carries an access token BurnRate obtained with the operator's own
+// MoneyLover login and performs no sign-in of its own: no email, no password,
+// no cached session, no renewal. ensureTokenLocked leaves an injected token
+// alone, so nothing here can reach the login flow.
+//
+// This is the whole point of the adapter. BurnRate must hold the MoneyLover
+// login anyway in order to read the wallet, so asking for the same password
+// again on the operator's machine bought nothing and cost two things: a second
+// copy of the credential, and an adapter that stopped writing after an hour
+// because a resumed session had no password to renew itself with. A token is
+// exactly enough for the one POST this program makes, it expires by itself,
+// and a fresh one arrives with the next batch.
+func NewWithToken(token string) *Client {
+	return &Client{
+		apiBase:     defaultAPIBase,
+		oauthURL:    defaultOAuthURL,
+		httpc:       &http.Client{Timeout: httpTimeout},
+		accessToken: token,
+	}
+}
+
 // SetSettings wires the store used for the writes-frozen check. main MUST
 // call this before AddTransaction is used; unwired clients refuse writes.
 func (c *Client) SetSettings(sg SettingGetter) {

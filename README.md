@@ -22,9 +22,11 @@ Every decision stays on the server — which rows, which wallet, which category,
 what the note says. This program is handed finished payloads it can only
 transmit. **A bug here can fail to write; it cannot write the wrong thing.**
 
-Your MoneyLover password is entered on your machine, used to sign in, and never
-stored — only the resulting session is cached. It never reaches the BurnRate
-server.
+**This program holds no credentials at all.** Your MoneyLover login stays in
+BurnRate, which needs it anyway in order to read your wallet. Each batch of
+work arrives with a short-lived MoneyLover session attached, used for those
+writes and then dropped. Nothing is stored, nothing is cached, and there is
+nothing to type.
 
 ## Using it
 
@@ -46,9 +48,8 @@ server.
    from step 2 — in the **same folder**, then run the adapter. It looks for
    its settings beside itself, so the folder is the only thing that matters.
 
-It asks for your MoneyLover email and password once, checks that writes from
-your computer actually reach MoneyLover, and then checks for work every 60
-seconds.
+It asks for nothing. It checks for work every 60 seconds, and each batch
+arrives with the session it needs.
 
 It runs in a terminal window and that window has to stay open — there is no
 autostart yet, so after a restart you start it again yourself. A version that
@@ -71,7 +72,8 @@ hundred dollars a year, which is not yet worth it.
 
 Sends a deliberately invalid write and reports which side answered. MoneyLover
 rejecting it is the good outcome — it means the request arrived. Nothing is
-created either way.
+created either way. It borrows a session from BurnRate to do this, so BurnRate
+has to be reachable and its MoneyLover login has to work.
 
 ### While it is not running
 
