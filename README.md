@@ -28,11 +28,23 @@ server.
 
 ## Using it
 
-1. Download the file for your platform from
-   [Releases](https://github.com/azfoundary/burnrate-adapter/releases/latest).
+1. Download the adapter for your platform from
+   [Releases](https://github.com/azfoundary/burnrate-adapter/releases/latest):
+
+   | Platform | File |
+   | --- | --- |
+   | macOS (Apple Silicon) | `burnrate-adapter-darwin-arm64` |
+   | macOS (Intel) | `burnrate-adapter-darwin-amd64` |
+   | Windows | `burnrate-adapter-windows-amd64.exe` |
+   | Linux | `burnrate-adapter-linux-amd64` |
+
+   A browser cannot tell an Apple Silicon Mac from an Intel one, so if the
+   file refuses to open and mentions the CPU, you have the other one.
 2. In your own BurnRate, go to **Settings ▸ Adapter** and download
    `burnrate-adapter.json`. It already contains your address and key.
-3. Put both files in one folder and run the adapter.
+3. Put both downloads — the file from step 1 and `burnrate-adapter.json`
+   from step 2 — in the **same folder**, then run the adapter. It looks for
+   its settings beside itself, so the folder is the only thing that matters.
 
 It asks for your MoneyLover email and password once, checks that writes from
 your computer actually reach MoneyLover, offers to start itself when you log
