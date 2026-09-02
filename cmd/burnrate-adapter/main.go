@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.4.2"
+const adapterVersion = "1.5.0"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -203,8 +203,52 @@ func runAdapter(args []string) error {
 }
 
 // runLoop is the adapter, and the only place that decides when work happens.
+// serveReadsLoop answers BurnRate's wallet reads for as long as the adapter
+// runs. The jobs request is held open by the server, so this is one parked
+// call rather than a busy poll, and a read is answered the moment it is asked.
+func serveReadsLoop(ctx context.Context, cfg adapterConfig, rd *reader, u ui, stop <-chan struct{}) {
+	var lastErr string
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+		n, err := serveReads(ctx, cfg, rd, u)
+		switch {
+		case err != nil:
+			// Once per distinct problem. This loop turns over continuously, so
+			// repeating an unchanged reason would fill the log with one
+			// sentence and bury everything else.
+			if msg := err.Error(); msg != lastErr {
+				u.Logf("wallet reads: %v", err)
+				lastErr = msg
+			}
+			time.Sleep(10 * time.Second)
+		default:
+			lastErr = ""
+			if n > 0 {
+				u.Logf("answered %d wallet read(s) for BurnRate", n)
+			}
+		}
+	}
+}
+
 func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
 	rd := &reader{}
+
+	// Wallet reads run on their own, continuously, NOT in sequence with the
+	// writes below.
+	//
+	// Resolving a row to write is itself a wallet read, so a server preparing
+	// a batch waits on this adapter — and doing both in one sequence meant the
+	// adapter was inside the write request, unable to answer the read that
+	// request was waiting for. Both sides stalled until the call timed out,
+	// every cycle, and nothing was written or read.
+	go serveReadsLoop(ctx, cfg, rd, u, o.stop)
+
 	saidFrozen := false
 	for {
 		frozen, err := beat(ctx, cfg)
@@ -222,16 +266,6 @@ func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
 		default:
 			saidFrozen = false
 			u.Set(stateWorking, "Checking for work")
-
-			// Wallet reads first. When the operator keeps their MoneyLover
-			// login here, BurnRate cannot read the wallet at all until this
-			// runs — and the writes below depend on what those reads settle.
-			if reads, rerr := serveReads(ctx, cfg, rd, u); rerr != nil {
-				u.Set(stateOffline, "Cannot read your wallet")
-				u.Logf("wallet reads: %v", rerr)
-			} else if reads > 0 {
-				u.Logf("made %d wallet read(s) for BurnRate", reads)
-			}
 
 			n, failed, passErr := adapterPass(ctx, cfg, o.limit, u, rd)
 			switch {
@@ -550,9 +584,24 @@ func beat(ctx context.Context, cfg adapterConfig) (bool, error) {
 	return out.Frozen, nil
 }
 
-func call(ctx context.Context, cfg adapterConfig, method, url string, body []byte) ([]byte, error) {
-	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+// callFor is call with an explicit deadline, for the one request the server
+// deliberately holds open.
+func callFor(ctx context.Context, cfg adapterConfig, method, url string, body []byte, d time.Duration) ([]byte, error) {
+	c, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
+	return call(c, cfg, method, url, body)
+}
+
+func call(ctx context.Context, cfg adapterConfig, method, url string, body []byte) ([]byte, error) {
+	// Thirty seconds unless the caller already set a deadline. Without that
+	// check the inner timeout silently overrode the longer one callFor exists
+	// to give the held-open jobs request, cancelling it while it worked.
+	rctx := ctx
+	if _, set := ctx.Deadline(); !set {
+		var cancel context.CancelFunc
+		rctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)

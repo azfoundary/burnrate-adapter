@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/azfoundary/burnrate-adapter/moneylover"
 )
@@ -87,7 +88,10 @@ func serveReads(ctx context.Context, cfg adapterConfig, rd *reader, u ui) (int, 
 }
 
 func fetchJobs(ctx context.Context, cfg adapterConfig) ([]relayJob, error) {
-	body, err := call(ctx, cfg, http.MethodGet, cfg.Server+"/api/adapter/jobs", nil)
+	// Longer than the 25 seconds BurnRate holds this request open, with room
+	// for the round trip. The shared 30-second deadline left almost none, so a
+	// slow moment would cancel a request that was working exactly as designed.
+	body, err := callFor(ctx, cfg, http.MethodGet, cfg.Server+"/api/adapter/jobs", nil, 45*time.Second)
 	if err != nil {
 		return nil, err
 	}
