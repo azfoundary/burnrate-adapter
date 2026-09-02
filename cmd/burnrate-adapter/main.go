@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.5.1"
+const adapterVersion = "1.6.0"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs

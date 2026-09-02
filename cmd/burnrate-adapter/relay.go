@@ -27,23 +27,30 @@ type relayJob struct {
 // this computer, and it holds the password for the life of the process so it
 // can renew itself — which is what makes unattended running possible at all.
 type reader struct {
-	mu sync.Mutex
-	ml *moneylover.Client
+	mu    sync.Mutex
+	ml    *moneylover.Client
+	email string // which account the cached client is signed in as
 }
 
 func (r *reader) client() (*moneylover.Client, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.ml != nil {
+	// Signing in happens in a SEPARATE process that the tray launches, so this
+	// one has to notice. Comparing the account means signing in as somebody
+	// else takes effect on the next pass instead of at the next restart —
+	// otherwise the menu would name the new account while every read still ran
+	// as the old one.
+	if r.ml != nil && r.email == savedEmail() {
 		return r.ml, nil
 	}
 	email, password, err := loadCreds()
 	if err != nil {
+		r.ml, r.email = nil, ""
 		return nil, err
 	}
 	ml := moneylover.New(email, password, sessionCachePath())
 	ml.SetSettings(localSettings{})
-	r.ml = ml
+	r.ml, r.email = ml, email
 	return ml, nil
 }
 

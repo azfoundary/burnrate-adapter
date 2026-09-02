@@ -64,6 +64,30 @@ func loadCreds() (email, password string, err error) {
 	return c.Email, pw, nil
 }
 
+// savedEmail is which MoneyLover account is signed in here, or "".
+//
+// Reads the file WITHOUT unsealing the password: the tray asks this once a
+// minute merely to label a menu item, and decrypting a credential to answer
+// "are we signed in" would be doing something dangerous to display something
+// harmless.
+func savedEmail() string {
+	b, err := os.ReadFile(credsPath())
+	if err != nil {
+		return ""
+	}
+	return emailFrom(b)
+}
+
+// emailFrom is the parsing half, split out so it can be tested without a file
+// beside an executable a test cannot place.
+func emailFrom(b []byte) string {
+	var c creds
+	if err := json.Unmarshal(b, &c); err != nil {
+		return ""
+	}
+	return c.Email
+}
+
 func saveCreds(email, password string) error {
 	sealed, err := sealPassword(password)
 	if err != nil {

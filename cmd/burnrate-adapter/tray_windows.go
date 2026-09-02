@@ -24,8 +24,11 @@ type trayUI struct {
 	mu      sync.Mutex
 	log     *logWriter
 	status  *systray.MenuItem
+	account *systray.MenuItem
 	written int
 	last    state
+	// lastAccount avoids rewriting an unchanged menu title every minute.
+	lastAccount string
 }
 
 func (t *trayUI) Set(s state, detail string) {
@@ -41,8 +44,22 @@ func (t *trayUI) Set(s state, detail string) {
 	if t.written > 0 {
 		line = fmt.Sprintf("%s · %d written", detail, t.written)
 	}
-	systray.SetTooltip("BurnRate Adapter — " + line)
+	systray.SetTooltip("BurnRate Adapter " + adapterVersion + " — " + line)
 	t.status.SetTitle(line)
+
+	// Whether this computer holds a MoneyLover login, said where it is asked.
+	// Nothing in the interface answered that, so the only way to find out was
+	// to go looking for a file in a folder — and the file sits beside another
+	// with almost the same name, which is how an operator came to believe they
+	// had signed in when they had not.
+	account := "MoneyLover: not signed in"
+	if email := savedEmail(); email != "" {
+		account = "MoneyLover: " + email
+	}
+	if account != t.lastAccount {
+		t.account.SetTitle(account)
+		t.lastAccount = account
+	}
 }
 
 func (t *trayUI) Wrote(n int) {
@@ -94,6 +111,14 @@ func launch(ctx context.Context, cfg adapterConfig, o loopOpts) error {
 
 		status := systray.AddMenuItem("Starting…", "")
 		status.Disable()
+		// Which build is running. Downloading always gives the newest release,
+		// so the only way to tell what you are actually running was to read a
+		// log file — and three separate updates were believed done while the
+		// previous binary was still running.
+		version := systray.AddMenuItem("BurnRate Adapter "+adapterVersion, "The version running right now")
+		version.Disable()
+		account := systray.AddMenuItem("MoneyLover: checking…", "Which MoneyLover account this computer is signed in to")
+		account.Disable()
 		systray.AddSeparator()
 		writeNow := systray.AddMenuItem("Check for work now", "Look for entries to write without waiting")
 		open := systray.AddMenuItem("Open BurnRate", "Open the ledger in your browser")
@@ -106,7 +131,7 @@ func launch(ctx context.Context, cfg adapterConfig, o loopOpts) error {
 		systray.AddSeparator()
 		quitItem := systray.AddMenuItem("Quit", "Stop writing to MoneyLover until started again")
 
-		ui := &trayUI{log: log, status: status, last: -1}
+		ui := &trayUI{log: log, status: status, account: account, last: -1}
 		ui.Logf("BurnRate Adapter %s starting, connected to %s", adapterVersion, short(cfg.Server))
 
 		wg.Add(1)
