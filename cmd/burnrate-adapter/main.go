@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.6.0"
+const adapterVersion = "1.6.1"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -228,7 +228,17 @@ func serveReadsLoop(ctx context.Context, cfg adapterConfig, rd *reader, u ui, st
 			}
 			time.Sleep(10 * time.Second)
 		default:
-			lastErr = ""
+			// Say so when it comes back.
+			//
+			// Repeats of an unchanged failure are suppressed and success is
+			// silent, so recovery and "still broken, same reason" looked
+			// identical in the file: both were nothing. A log that cannot
+			// distinguish those two cannot answer the only question anybody
+			// asks it after a failure.
+			if lastErr != "" {
+				u.Logf("wallet reads: working again")
+				lastErr = ""
+			}
 			if n > 0 {
 				u.Logf("answered %d wallet read(s) for BurnRate", n)
 			}
@@ -250,12 +260,14 @@ func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
 	go serveReadsLoop(ctx, cfg, rd, u, o.stop)
 
 	saidFrozen := false
+	unreachable := false
 	for {
 		frozen, err := beat(ctx, cfg)
 		switch {
 		case err != nil:
 			u.Set(stateOffline, "Can't reach BurnRate")
 			u.Logf("can't reach BurnRate: %v", err)
+			unreachable = true
 		case frozen:
 			u.Set(statePaused, "BurnRate has paused writing")
 			if !saidFrozen {
@@ -264,6 +276,10 @@ func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
 				saidFrozen = true
 			}
 		default:
+			if unreachable {
+				u.Logf("BurnRate is reachable again")
+				unreachable = false
+			}
 			saidFrozen = false
 			u.Set(stateWorking, "Checking for work")
 
