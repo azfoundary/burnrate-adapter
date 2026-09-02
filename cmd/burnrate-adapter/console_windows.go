@@ -21,15 +21,26 @@ const attachParentProcess = ^uint32(0) // (DWORD)-1: the process that launched u
 // where the person is looking. Allocating a fresh console is the fallback for
 // a double-click.
 func attachConsole() {
+	// Both of these fail when the process already has a console — which is the
+	// case for the sign-in window the tray spawns with CREATE_NEW_CONSOLE.
+	// That is not an error, and it must not skip the reopening below: it did,
+	// and the sign-in prompt then had nowhere to read from.
 	if !winConsoleCall("AttachConsole", uintptr(attachParentProcess)) {
-		if !winConsoleCall("AllocConsole") {
-			return
-		}
+		winConsoleCall("AllocConsole")
 	}
-	// Go cached the handles at startup, when there was no console, so stdout
-	// and stderr have to be reopened against the one that now exists.
+	// Go cached the std handles at startup, when a windowsgui process had
+	// none. Reopen all three against whatever console exists now.
+	//
+	// STDIN especially. A child started by the tray inherits NUL for stdin,
+	// because exec.Command with a nil Stdin hands the process the null device
+	// on Windows — so every prompt read end-of-file the instant it was asked,
+	// and signing in failed with "both an email and a password are needed"
+	// while a console window sat there with nowhere to type.
+	if h, err := os.OpenFile("CONIN$", os.O_RDWR, 0); err == nil {
+		os.Stdin = h
+	}
 	for _, f := range []**os.File{&os.Stdout, &os.Stderr} {
-		if h, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+		if h, err := os.OpenFile("CONOUT$", os.O_RDWR, 0); err == nil {
 			*f = h
 		}
 	}

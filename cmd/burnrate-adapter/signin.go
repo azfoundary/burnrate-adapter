@@ -45,7 +45,18 @@ func runSignIn(ctx context.Context) error {
 	}
 	fmt.Println("  Saved. The adapter can now read your wallet for BurnRate.")
 	fmt.Printf("  Stored at %s\n", credsPath())
+	holdOpen()
 	return nil
+}
+
+// holdOpen waits for a keypress before the window closes.
+//
+// The tray opens this console itself, so it disappears the instant this
+// returns - taking the outcome with it. A sign-in that says nothing before
+// vanishing cannot be told apart from one that never ran.
+func holdOpen() {
+	fmt.Print("\n  Press Enter to close this window. ")
+	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
 // runSignOut removes the saved login.
@@ -58,6 +69,7 @@ func runSignOut() error {
 	fmt.Println("\n  The saved MoneyLover login has been removed from this computer.")
 	fmt.Println("  BurnRate cannot read your wallet until you sign in again here,")
 	fmt.Println("  or move the login back to BurnRate in Settings.")
+	holdOpen()
 	return nil
 }
 
