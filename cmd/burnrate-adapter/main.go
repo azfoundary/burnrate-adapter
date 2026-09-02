@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.5.0"
+const adapterVersion = "1.5.1"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -411,7 +411,20 @@ func adapterPass(ctx context.Context, cfg adapterConfig, limit int, u ui, rd *re
 		// BurnRate has no session to lend. Writing uses the same one the
 		// reads use.
 		if ml, err = rd.client(); err != nil {
-			return 0, 0, err
+			// Hand them back before giving up. BurnRate marked every one of
+			// these in flight on the way out, and a row it never hears about
+			// is held for four hours and hidden from the To-mirror list - so
+			// simply returning here quarantined the whole batch over a problem
+			// that never touched MoneyLover. Nothing was sent, so nothing
+			// landed, and saying so releases them immediately.
+			unsent := make([]adapterResult, 0, len(rows))
+			for _, r := range rows {
+				unsent = append(unsent, adapterResult{TxnID: r.TxnID, Error: err.Error()})
+			}
+			if rerr := report(ctx, cfg, unsent); rerr != nil {
+				u.Logf("could not report %d unwritten rows: %v", len(unsent), rerr)
+			}
+			return 0, len(rows), err
 		}
 	} else {
 		// A client for this batch and no longer. It holds the token BurnRate
