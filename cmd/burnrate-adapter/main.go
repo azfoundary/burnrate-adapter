@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.3.0"
+const adapterVersion = "1.4.0"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -233,7 +233,7 @@ func runLoop(ctx context.Context, cfg adapterConfig, o loopOpts, u ui) error {
 				u.Logf("made %d wallet read(s) for BurnRate", reads)
 			}
 
-			n, failed, passErr := adapterPass(ctx, cfg, o.limit, u)
+			n, failed, passErr := adapterPass(ctx, cfg, o.limit, u, rd)
 			switch {
 			case passErr != nil:
 				u.Set(stateOffline, "Last attempt failed")
@@ -366,15 +366,25 @@ func adapterProbe(ctx context.Context, ml *moneylover.Client) error {
 	}
 }
 
-func adapterPass(ctx context.Context, cfg adapterConfig, limit int, u ui) (wroteN, failedN int, err error) {
-	rows, token, err := fetchQueue(ctx, cfg, limit)
+func adapterPass(ctx context.Context, cfg adapterConfig, limit int, u ui, rd *reader) (wroteN, failedN int, err error) {
+	rows, token, local, err := fetchQueue(ctx, cfg, limit)
 	if err != nil || len(rows) == 0 {
 		return 0, 0, err
 	}
-	// A client for this batch and no longer. It holds the token BurnRate sent
-	// and nothing else - no login, no password, nothing on disk.
-	ml := moneylover.NewWithToken(token)
-	ml.SetSettings(localSettings{})
+	var ml *moneylover.Client
+	if local {
+		// The operator keeps their MoneyLover login on this computer, so
+		// BurnRate has no session to lend. Writing uses the same one the
+		// reads use.
+		if ml, err = rd.client(); err != nil {
+			return 0, 0, err
+		}
+	} else {
+		// A client for this batch and no longer. It holds the token BurnRate
+		// sent and nothing else - no login, no password, nothing on disk.
+		ml = moneylover.NewWithToken(token)
+		ml.SetSettings(localSettings{})
+	}
 	results := make([]adapterResult, 0, len(rows))
 	wrote := 0
 	expired := false
@@ -471,29 +481,39 @@ func classify(txnID int64, err error) adapterResult {
 // with. The token comes WITH the batch rather than being held between passes:
 // it is the credential for someone's real wallet, so it lives in this process
 // for as long as one batch takes and no longer.
-func fetchQueue(ctx context.Context, cfg adapterConfig, limit int) ([]adapterRow, string, error) {
+// fetchQueue returns the rows to write, the MoneyLover token to write them
+// with, and whether to use this computer's own login instead.
+//
+// The token comes WITH the batch rather than being held between passes: it is
+// the credential for someone's real wallet, so it lives in this process for as
+// long as one batch takes and no longer. When the operator keeps their login
+// here, BurnRate has none to send and says so explicitly — a batch that merely
+// arrived without one is refused, which is right when a token was meant to be
+// there and wrong when it never was.
+func fetchQueue(ctx context.Context, cfg adapterConfig, limit int) ([]adapterRow, string, bool, error) {
 	u := cfg.Server + "/api/adapter/queue"
 	if limit > 0 {
 		u += "?limit=" + strconv.Itoa(limit)
 	}
 	body, err := call(ctx, cfg, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	var out struct {
-		Rows  []adapterRow `json:"rows"`
-		Token string       `json:"token"`
+		Rows            []adapterRow `json:"rows"`
+		Token           string       `json:"token"`
+		UseLocalSession bool         `json:"use_local_session"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, "", fmt.Errorf("queue: %w", err)
+		return nil, "", false, fmt.Errorf("queue: %w", err)
 	}
-	if len(out.Rows) > 0 && out.Token == "" {
+	if len(out.Rows) > 0 && out.Token == "" && !out.UseLocalSession {
 		// Refusing beats attempting: BurnRate has already marked these rows as
 		// in flight, and a batch sent with no token would fail every row and
 		// hold each one for four hours.
-		return nil, "", errors.New("BurnRate sent work but no MoneyLover token - update BurnRate")
+		return nil, "", false, errors.New("BurnRate sent work but no MoneyLover token - update BurnRate")
 	}
-	return out.Rows, out.Token, nil
+	return out.Rows, out.Token, out.UseLocalSession, nil
 }
 
 func report(ctx context.Context, cfg adapterConfig, results []adapterResult) error {
