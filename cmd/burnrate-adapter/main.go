@@ -39,7 +39,7 @@ import (
 // adapterVersion is reported on every heartbeat so the server can say when a
 // newer one is available. Bumped by hand: a version tracking the server build
 // would claim a compatibility nobody tested.
-const adapterVersion = "1.4.0"
+const adapterVersion = "1.4.1"
 
 // configName sits beside the binary. The user downloads it from their own
 // BurnRate, already filled in — which is the whole reason this program needs
@@ -575,9 +575,34 @@ func call(ctx context.Context, cfg adapterConfig, method, url string, body []byt
 		return nil, errors.New("BurnRate rejected this adapter's token — download " + configName + " again from Settings, Adapter")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, why(b))
 	}
 	return b, nil
+}
+
+// why turns a failed response body into one short line.
+//
+// It used to be the whole body, up to a megabyte. BurnRate answers in JSON so
+// that was usually fine — until something in front of it did not: a proxy
+// error page during a deploy put an entire HTML document into the log, one
+// line per tag, which pushed the history that mattered out through the log's
+// own truncation. A log nobody can read is the same as no log, and this file
+// is the only account of what the adapter did.
+func why(b []byte) string {
+	var out struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(b, &out); err == nil && out.Error != "" {
+		return out.Error
+	}
+	line := strings.Join(strings.Fields(string(b)), " ")
+	if len(line) > 200 {
+		line = line[:200] + "…"
+	}
+	if line == "" {
+		return "(no detail)"
+	}
+	return line
 }
 
 func short(u string) string {
